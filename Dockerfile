@@ -46,7 +46,7 @@ RUN pip install --upgrade pip && \
 COPY . .
 
 # Create upload directory expected by the app
-RUN mkdir -p /app/static/uploads
+RUN mkdir -p /app/static/uploads /app/offline_models
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 # All secrets/config are injected via environment variables at runtime.
