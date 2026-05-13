@@ -5,8 +5,8 @@ No users, no login, no courses, no assignments.
 Upload files → Run plagiarism scan → View results with threshold filter.
 Like iLovePDF but for plagiarism detection.
 """
-import eventlet
-eventlet.monkey_patch()
+from gevent import monkey
+monkey.patch_all()
 
 import json
 import uuid
@@ -58,7 +58,7 @@ app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1 GB
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Initialize SocketIO
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
 
 # Database
 db.init_app(app)
