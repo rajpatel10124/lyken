@@ -65,13 +65,7 @@ def fromjson_filter(value):
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL WARMUP
 # ─────────────────────────────────────────────────────────────────────────────
-@app.before_request
-def warmup_once():
-    """Trigger model warmup on the first request if not already done."""
-    if not hasattr(app, '_models_warmed'):
-        app._models_warmed = True
-        print("[SCHOLARIS] Starting background model warmup...")
-        threading.Thread(target=logic.warmup_models, daemon=True).start()
+# Model warmup handled in init_db_and_models
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,10 +207,8 @@ def result_heatmap(run_id, result_id):
     if result.run_id != run_id:
         abort(404)
 
-    # Gate: only show heatmap for digital (computerized) files
-    if not result.is_digital:
-        flash('Heatmap is only available for computerized (digital text) files, not OCR-extracted documents.', 'warning')
-        return redirect(url_for('scan_results', run_id=run_id))
+    # Heatmap is now available for ALL files (Computerized & OCR)
+    # The user wants to see matches even in handwritten scans.
 
     heatmap_data = json.loads(result.sentence_map or '[]')
     return render_template('heatmap_view.html',
@@ -374,7 +366,7 @@ def run_bulk_check_task(app, run_id, temp_dir, threshold):
             def _extract_one(p):
                 return p, logic.extract_text_bulk(p)
 
-            _workers = min(2, len(filtered_paths))
+            _workers = min(4, len(filtered_paths))
             with ThreadPoolExecutor(max_workers=_workers) as pool:
                 futures = {pool.submit(_extract_one, p): p for p in filtered_paths}
                 for fut in as_completed(futures):
@@ -529,7 +521,7 @@ def run_bulk_check_task(app, run_id, temp_dir, threshold):
                     _others = [s for s in all_submissions if s['_unique_id'] != _uid]
                     _rep = logic.bulk_run_plagiarism_check_preextracted(
                         text=_txt, file_hash=_hash,
-                        ocr_confidence=_conf or 100.0,
+                        ocr_confidence=_conf if _conf is not None else 100.0,
                         other_submissions=_others,
                         threshold=threshold,
                         precomputed_embeddings=precomputed_embeddings,
@@ -677,9 +669,6 @@ if __name__ == '__main__':
                         pass
 
         check_dependencies()
-        try:
-            logic.warmup_models()
-        except Exception as e:
-            print(f"[WARN] Model warmup failed (will load on first use): {e}")
+        # Initialisation thread already running
     
     socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)

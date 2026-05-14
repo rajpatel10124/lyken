@@ -114,16 +114,29 @@ try:
 except ImportError:
     _HAS_DOCX = False
 
-# ── Similarity / ML (Lazy Loading for 'Instant Wake-up') ──────────────────────
-_ST_MODEL = None
-_TFIDF    = None
+# ── Scikit-Learn (TF-IDF & Cosine Similarity) ─────────────────────────────────
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
 
-# ── Corpus-level TF-IDF (set once per batch by app.py) ───────────────────────
-# When fitted on ALL documents in the batch, common terms like "router rip",
-# "objective", "experiment", "routing table" get near-zero IDF weight because
-# they appear in almost every submission. Only genuinely unique phrases score
-# high. This is the primary defence against same-topic false positives.
-_CORPUS_TFIDF = None
+# ── Model State & Locks ───────────────────────────────────────────────────────
+_st_model       = None
+_tfidf_vec      = None
+_easyocr_reader = None
+_paddle_ocr     = None
+_trocr_proc     = None
+_trocr_model    = None
+
+import threading
+_MODEL_LOCK = threading.Lock()
+
+# Suppress noisy Transformers logging
+import logging
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 def set_corpus_tfidf(vectorizer):
     """Called by app.py after fitting TF-IDF on the full batch corpus."""
@@ -132,45 +145,42 @@ def set_corpus_tfidf(vectorizer):
     print(f"[logic] Corpus TF-IDF set — common lab terms now down-weighted.")
 
 def _get_st_model():
-    global _ST_MODEL
-    if _ST_MODEL is None:
+    global _st_model
+    if _st_model is None:
         print("[logic] Loading SentenceTransformer (mpnet-base-v2)...")
         from sentence_transformers import SentenceTransformer
-        _ST_MODEL = SentenceTransformer('all-mpnet-base-v2')
-    return _ST_MODEL
+        _st_model = SentenceTransformer('all-mpnet-base-v2')
+    return _st_model
 
 def _get_tfidf_vectorizer():
-    global _TFIDF
-    if _TFIDF is None:
+    global _tfidf_vec
+    if _tfidf_vec is None:
         from sklearn.feature_extraction.text import TfidfVectorizer
-        _TFIDF = TfidfVectorizer(ngram_range=(1,2), max_features=5000)
-    return _TFIDF
+        _tfidf_vec = TfidfVectorizer(ngram_range=(1,2), max_features=5000)
+    return _tfidf_vec
 
 # ── AI Detection (Layer 3) — Lazy Loading ────────────────────────────────────
-_AI_MODEL = None
-_AI_TOKENIZER = None
+_ai_model = None
+_ai_tokenizer = None
 
 def _get_ai_detect_model():
-    global _AI_MODEL, _AI_TOKENIZER
-    if _AI_MODEL is None:
+    global _ai_model, _ai_tokenizer
+    if _ai_model is None:
         print("[logic] Loading GPT-2 for Layer 3 AI Detection...")
-        # Production optimization: offload other models if RAM is tight
-        # (Though m5.large has 8GB, it's good practice)
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        import torch as _torch
         try:
-            _AI_TOKENIZER = AutoTokenizer.from_pretrained("gpt2")
-            _AI_MODEL = AutoModelForCausalLM.from_pretrained("gpt2")
-            _AI_MODEL.eval()
+            _ai_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            _ai_model = AutoModelForCausalLM.from_pretrained("gpt2")
+            _ai_model.eval()
         except Exception as e:
             print(f"[logic] AI Model Load Error: {e}")
             return None, None
-    return _AI_MODEL, _AI_TOKENIZER
+    return _ai_model, _ai_tokenizer
 
 def _offload_ai_model():
-    global _AI_MODEL, _AI_TOKENIZER
-    _AI_MODEL = None
-    _AI_TOKENIZER = None
+    global _ai_model, _ai_tokenizer
+    _ai_model = None
+    _ai_tokenizer = None
     import gc
     gc.collect()
 
@@ -210,13 +220,7 @@ print(f"[logic] OCR engines: {_OCR_ENGINES or ['NONE — install tesseract!']}")
 print(f"[logic] PDF:  fitz={_HAS_FITZ} pdfplumber={_HAS_PDFPLUMBER} pypdf={_HAS_PYPDF} pdf2img={_HAS_PDF2IMG}")
 print(f"[logic] ML:   sklearn={_HAS_SKLEARN} ST={_HAS_ST} nltk={_HAS_NLTK} rf={_HAS_RF}")
 
-# ── Model cache ───────────────────────────────────────────────────────────────
-_st_model       = None
-_cross_model    = None
-_easyocr_reader = None
-_paddle_ocr     = None
-_trocr_proc     = None
-_trocr_model    = None
+# Model cache removed (moved to top)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -453,7 +457,7 @@ def detect_ai_dna(text: str, threshold: float = 70.0) -> dict:
 # IMAGE PREPROCESSING PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _preprocess_image_cv2(pil_img: Image.Image) -> Image.Image:
+def _preprocess_image_cv2(pil_img: Image.Image, binarize: bool = True) -> Image.Image:
     """
     Full OpenCV preprocessing:
       1. Grayscale conversion
@@ -463,7 +467,7 @@ def _preprocess_image_cv2(pil_img: Image.Image) -> Image.Image:
       5. Gamma correction for brightness normalisation
       6. CLAHE adaptive histogram equalisation
       7. NLM denoising
-      8. Otsu binarisation (adaptive fallback for extreme contrast)
+      8. Otsu binarisation (optional, best for Tesseract)
     """
     if not _HAS_CV2:
         return _preprocess_image_pil(pil_img)
@@ -533,6 +537,9 @@ def _preprocess_image_cv2(pil_img: Image.Image) -> Image.Image:
     except Exception:
         pass
 
+    if not binarize:
+        return Image.fromarray(gray)
+
     # 7. Otsu binarisation
     try:
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -571,9 +578,15 @@ def _preprocess_variants(pil_img: Image.Image) -> list:
     # Raw grayscale — fastest, good baseline
     variants.append((ImageOps.grayscale(pil_img), "gray_raw"))
 
-    # Full OpenCV pipeline — best for clean document scans
+    # Full OpenCV pipeline (binarised) — best for clean document scans
     try:
-        variants.append((_preprocess_image_cv2(pil_img), "cv2_full"))
+        variants.append((_preprocess_image_cv2(pil_img, binarize=True), "cv2_full"))
+    except Exception:
+        pass
+
+    # Grayscale CV2 (no binarisation) — best for Deep Learning OCR (EasyOCR/TrOCR)
+    try:
+        variants.append((_preprocess_image_cv2(pil_img, binarize=False), "cv2_no_bin"))
     except Exception:
         pass
 
@@ -662,7 +675,7 @@ def _ocr_tesseract_fast(pil_img: Image.Image) -> tuple:
         return "", 0.0
 
 
-def _tess_cli_ocr_page(gray_array: np.ndarray, timeout: int = 20) -> str:
+def _tess_cli_ocr_page(gray_array: np.ndarray, timeout: int = 45) -> str:
     """
     Run Tesseract as a CLI subprocess on a grayscale numpy image array.
 
@@ -730,14 +743,16 @@ def _ocr_easyocr(pil_img: Image.Image) -> tuple:
     global _easyocr_reader
     try:
         if _easyocr_reader is None:
-            print("[EasyOCR] Loading deep learning model (first use ~5s)…")
-            _easyocr_reader = _easyocr.Reader(
-                ['en'],
-                gpu=False,          # set True if CUDA GPU available
-                verbose=False,
-                model_storage_directory=os.path.expanduser("~/.EasyOCR/model"),
-            )
-            print("[EasyOCR] Ready.")
+            with _MODEL_LOCK:
+                if _easyocr_reader is None:
+                    print("[EasyOCR] Loading deep learning model (first use)…")
+                    _easyocr_reader = _easyocr.Reader(
+                        ['en'],
+                        gpu=False,          # set True if CUDA GPU available
+                        verbose=False,
+                        model_storage_directory=os.path.expanduser("~/.EasyOCR/model"),
+                    )
+                    print("[EasyOCR] Ready.")
 
         img_array = np.array(pil_img.convert("RGB"))
         results   = _easyocr_reader.readtext(img_array, detail=1, paragraph=False)
@@ -775,14 +790,16 @@ def _ocr_paddleocr(pil_img: Image.Image) -> tuple:
     global _paddle_ocr
     try:
         if _paddle_ocr is None:
-            print("[PaddleOCR] Loading model (first use)…")
-            _paddle_ocr = _PaddleOCR(
-                use_angle_cls=True,
-                lang='en',
-                use_gpu=False,
-                show_log=False,
-            )
-            print("[PaddleOCR] Ready.")
+            with _MODEL_LOCK:
+                if _paddle_ocr is None:
+                    print("[PaddleOCR] Loading model (first use)…")
+                    _paddle_ocr = _PaddleOCR(
+                        use_angle_cls=True,
+                        lang='en',
+                        use_gpu=False,
+                        show_log=False,
+                    )
+                    print("[PaddleOCR] Ready.")
 
         img_array = np.array(pil_img.convert("RGB"))
         result    = _paddle_ocr.ocr(img_array, cls=True)
@@ -823,13 +840,14 @@ def _ocr_trocr(pil_img: Image.Image) -> tuple:
     global _trocr_proc, _trocr_model
     try:
         if _trocr_proc is None:
-            print("[TrOCR] Loading model (first use, downloads ~500MB)…")
-            # 'printed' for typed text, 'handwritten' for cursive/handwriting
-            model_name   = "microsoft/trocr-base-printed"
-            _trocr_proc  = TrOCRProcessor.from_pretrained(model_name)
-            _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name)
-            _trocr_model.eval()
-            print("[TrOCR] Ready.")
+            with _MODEL_LOCK:
+                if _trocr_proc is None:
+                    print("[TrOCR] Loading model (first use)…")
+                    model_name = "microsoft/trocr-base-handwritten"
+                    _trocr_proc = TrOCRProcessor.from_pretrained(model_name)
+                    _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name)
+                    _trocr_model.eval()
+                    print("[TrOCR] Ready.")
 
         img_rgb = pil_img.convert("RGB")
         w, h    = img_rgb.size
@@ -876,7 +894,7 @@ def _score_ocr_result(text: str, conf: float) -> float:
 
 
 def ocr_image(pil_img: Image.Image, check_handwritten: bool = True,
-              engine: str = "auto") -> tuple:
+              engine: str = "auto", fast_mode: bool = False) -> tuple:
     """
     Main OCR entry point. Runs all available engines across preprocessing
     variants and returns the highest-scoring result.
@@ -889,11 +907,8 @@ def ocr_image(pil_img: Image.Image, check_handwritten: bool = True,
     Returns:
         (text: str, confidence: float 0-100, engine_used: str)
     """
-    if pil_img is None:
-        return "", 0.0, "none"
-
-    # Cap image size — very large images give no OCR benefit
-    MAX_DIM = 3500
+    # Cap image size for performance
+    MAX_DIM = 2500 if fast_mode else 3500
     w, h = pil_img.size
     if max(w, h) > MAX_DIM:
         scale   = MAX_DIM / max(w, h)
@@ -903,56 +918,60 @@ def ocr_image(pil_img: Image.Image, check_handwritten: bool = True,
                 else [(ImageOps.grayscale(pil_img), "gray_raw"),
                       (_preprocess_image_cv2(pil_img), "cv2_full")])
 
-    candidates = []  # (text, conf, engine_label, quality_score)
+    # In fast_mode, reduce variants to save time
+    if fast_mode and len(variants) > 2:
+        variants = variants[:2]
+
+    candidates = []
 
     def _try(eng_name, fn, img, vname):
         try:
             text, conf = fn(img)
             if text and text.strip():
                 score = _score_ocr_result(text, conf)
+                if check_handwritten and eng_name in ("EasyOCR", "TrOCR"):
+                    score += 5.0
                 candidates.append((text, conf, f"{eng_name}/{vname}", score))
-                print(f"[OCR] {eng_name}/{vname}: {len(text.split())} words, "
-                      f"conf={conf:.1f}, score={score:.1f}")
-        except Exception as e:
-            print(f"[OCR] {eng_name}/{vname} error: {e}")
+                print(f"[OCR] {eng_name}/{vname}: {len(text.split())} words, conf={conf:.1f}")
+        except Exception:
+            pass
 
-    # EasyOCR — runs on colour image (no need for grayscale)
+    # 1. EasyOCR (Fast DL)
     if engine in ("auto", "easyocr") and _HAS_EASYOCR:
         _try("EasyOCR", _ocr_easyocr, pil_img, "color")
-        if check_handwritten:
+        if check_handwritten and not fast_mode:
             try:
-                cv2_gray = _preprocess_image_cv2(pil_img)
-                rgb_from_gray = Image.merge("RGB", [cv2_gray]*3)
-                _try("EasyOCR", _ocr_easyocr, rgb_from_gray, "cv2_preprocessed")
-            except Exception:
-                pass
+                cv2_gray = _preprocess_image_cv2(pil_img, binarize=False)
+                _try("EasyOCR", _ocr_easyocr, Image.merge("RGB", [cv2_gray]*3), "cv2_nobin")
+            except Exception: pass
+        
+        # EARLY EXIT: If EasyOCR is very confident, skip others in fast_mode
+        if fast_mode and candidates and max(c[3] for c in candidates) > 85:
+            res = sorted(candidates, key=lambda x: x[3], reverse=True)[0]
+            return res[0], res[1], res[2]
 
-    # PaddleOCR
+    # 2. PaddleOCR
     if engine in ("auto", "paddle") and _HAS_PADDLE:
-        for img, vname in variants[:2]:
-            _try("PaddleOCR", _ocr_paddleocr, img, vname)
+        _try("PaddleOCR", _ocr_paddleocr, variants[0][0], variants[0][1])
 
-    # TrOCR — only for handwritten content
+    # 3. TrOCR (Slow Transformer) — Skip in fast_mode if we have a decent result
     if engine in ("auto", "trocr") and _HAS_TROCR and check_handwritten:
-        _try("TrOCR", _ocr_trocr, pil_img.convert("RGB"), "raw")
+        skip_trocr = fast_mode and candidates and max(c[3] for c in candidates) > 70
+        if not skip_trocr:
+            _try("TrOCR", _ocr_trocr, pil_img.convert("RGB"), "raw")
 
-    # Tesseract — run on all preprocessing variants
+    # 4. Tesseract (Fast Baseline)
     if engine in ("auto", "tesseract") and _HAS_TESS:
-        for img, vname in variants:
+        for img, vname in (variants[:1] if fast_mode else variants):
             _try("Tesseract", _ocr_tesseract, img, vname)
-            if candidates and max(c[3] for c in candidates) > 90:
-                break  # excellent result already found
 
     if not candidates:
-        print("[OCR] All engines produced no output.")
         return "", 0.0, "none"
+    
+    # Return best
+    res = sorted(candidates, key=lambda x: x[3], reverse=True)[0]
+    return res[0], res[1], res[2]
 
-    candidates.sort(key=lambda x: x[3], reverse=True)
-    best_text, best_conf, best_engine, best_score = candidates[0]
-    print(f"[OCR] Winner: {best_engine} | words={len(best_text.split())} "
-          f"conf={best_conf:.1f} score={best_score:.1f}")
-
-    return best_text, best_conf, best_engine
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1043,7 +1062,7 @@ def _extract_pdf_text(path: str, check_handwritten: bool = True) -> tuple:
             except Exception:
                 pass
 
-            text_out = _tess_cli_ocr_page(gray_arr, timeout=20)
+            text_out = _tess_cli_ocr_page(gray_arr, timeout=45)
             gray_arr = None; gc.collect()
 
             if text_out:
@@ -1141,9 +1160,9 @@ def _extract_pdf_text_bulk(path: str) -> tuple:
     except Exception:
         pass
 
-    _MAX_PAGES       = 3    # Balanced for speed/context
-    _DPI             = 140  # Standard DPI for faster processing
-    _EARLY_EXIT_WDS  = 300  
+    _MAX_PAGES       = 2    # 2 pages is enough for comparison
+    _DPI             = 100  # Lower DPI = faster render, still OCR-readable
+    _EARLY_EXIT_WDS  = 200  # Exit early once we have enough words
 
     print(f"[PDF-bulk] Scanned — rendering ≤{_MAX_PAGES} pages @ {_DPI} DPI via subprocess OCR…")
     page_texts, page_confs = [], []
@@ -1181,7 +1200,7 @@ def _extract_pdf_text_bulk(path: str) -> tuple:
                 pass
 
             # Subprocess OCR — memory-isolated, timeout-protected
-            text_out = _tess_cli_ocr_page(gray_arr, timeout=20)
+            text_out = _tess_cli_ocr_page(gray_arr, timeout=45)
             gray_arr = None; gc.collect()
 
             if text_out:
@@ -1235,10 +1254,50 @@ def _extract_image_text(path: str, check_handwritten: bool = True) -> tuple:
     return clean_text(text), conf
 
 
-def extract_text(file_path: str, check_handwritten: bool = True) -> tuple:
+def _extract_pdf_text(path: str, check_handwritten: bool = True, fast_mode: bool = False) -> tuple:
+    """Digital extraction first, fallback to OCR fusion."""
+    text = ""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        for page in reader.pages[:5]: # Cap at 5 pages
+            text += (page.extract_text() or "") + " "
+    except Exception:
+        pass
+    
+    clean = clean_text(text)
+    if len(clean.split()) > 100:
+        return clean, 100.0
+    
+    # Scanned PDF logic
+    return _ocr_pdf_fusion(path, check_handwritten, fast_mode)
+
+def _ocr_pdf_fusion(path: str, check_handwritten: bool = True, fast_mode: bool = False) -> tuple:
+    """Render PDF pages and run fused OCR."""
+    DPI = 110 if fast_mode else 140
+    MAX_PAGES = 2 if fast_mode else 3
+    
+    doc = _fitz.open(path)
+    combined_text = []
+    confs = []
+    
+    for i, page in enumerate(doc):
+        if i >= MAX_PAGES: break
+        mat = _fitz.Matrix(DPI/72, DPI/72)
+        pix = page.get_pixmap(matrix=mat, colorspace=_fitz.csGRAY)
+        img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+        
+        t, c, _ = ocr_image(img, check_handwritten=check_handwritten, fast_mode=fast_mode)
+        combined_text.append(t)
+        confs.append(c)
+        if fast_mode and sum(len(x.split()) for x in combined_text) > 250: break
+    
+    doc.close()
+    return " ".join(combined_text), (sum(confs)/len(confs) if confs else 0.0)
+
+def extract_text(file_path: str, check_handwritten: bool = True, fast_mode: bool = False) -> tuple:
     """
     Universal text extractor. Handles txt, pdf, images, docx.
-    Returns (text, binary_content, file_hash, ocr_confidence). Never raises.
     """
     if not os.path.exists(file_path):
         print(f"[extract_text] Not found: {file_path}")
@@ -1260,11 +1319,13 @@ def extract_text(file_path: str, check_handwritten: bool = True) -> tuple:
             text = clean_text(open(file_path, encoding="utf-8", errors="ignore").read())
 
         elif name.endswith(".pdf"):
-            text, conf = _extract_pdf_text(file_path, check_handwritten)
+            text, conf = _extract_pdf_text(file_path, check_handwritten, fast_mode)
 
         elif name.endswith((".png", ".jpg", ".jpeg", ".tiff", ".tif",
                             ".gif", ".webp", ".bmp")):
-            text, conf = _extract_image_text(file_path, check_handwritten)
+            # Use ocr_image directly for images
+            img = Image.open(file_path)
+            text, conf, _ = ocr_image(img, check_handwritten, fast_mode=fast_mode)
 
         elif name.endswith(".docx"):
             if _HAS_DOCX:
@@ -1302,14 +1363,14 @@ def extract_text(file_path: str, check_handwritten: bool = True) -> tuple:
 
 
 
-def extract_text_bulk(file_path: str) -> tuple:
+def extract_text_bulk(file_path: str, check_handwritten: bool = False) -> tuple:
     """
-    Bulk-safe text extractor — never loads heavy OCR engines (EasyOCR/PaddleOCR).
-    Uses Tesseract only for scanned PDFs, at low DPI with a page cap.
-    Returns (text, binary_content, file_hash, ocr_confidence). Never raises.
+    BULK-ONLY extractor — uses TESSERACT ONLY. Never loads EasyOCR/PaddleOCR/TrOCR.
+    This is intentional: heavy DL models take 60-120s to load per worker thread,
+    which destroys bulk performance. Tesseract is fast and good enough for comparison.
+    Returns (text, binary_content, file_hash, ocr_confidence).
     """
     if not os.path.exists(file_path):
-        print(f"[extract_text_bulk] Not found: {file_path}")
         return "", None, None, 0.0
 
     try:
@@ -1328,7 +1389,6 @@ def extract_text_bulk(file_path: str) -> tuple:
             text = clean_text(open(file_path, encoding="utf-8", errors="ignore").read())
 
         elif name.endswith(".pdf"):
-            # Use the lightweight bulk extractor (Tesseract-only for scanned)
             text, conf = _extract_pdf_text_bulk(file_path)
 
         elif name.endswith(".docx"):
@@ -1336,8 +1396,6 @@ def extract_text_bulk(file_path: str) -> tuple:
                 doc   = _DocxDoc(file_path)
                 paras = [p.text for p in doc.paragraphs if p.text.strip()]
                 text  = clean_text(" ".join(paras))
-            else:
-                print("[extract_text_bulk] python-docx not installed")
 
         elif name.endswith(".doc"):
             try:
@@ -1347,61 +1405,32 @@ def extract_text_bulk(file_path: str) -> tuple:
                 if r.returncode == 0:
                     text = clean_text(r.stdout)
             except FileNotFoundError:
-                print("[extract_text_bulk] antiword not installed for .doc")
+                pass
 
-        elif name.endswith((".png", ".jpg", ".jpeg", ".tiff", ".tif",
-                            ".gif", ".webp", ".bmp")):
-            # Images: Tesseract CLI subprocess (memory-isolated)
-            try:
-                import psutil as _psutil
-                if _psutil.virtual_memory().available < 300 * 1024 * 1024:
-                    print("[extract_text_bulk] Low memory — skipping image OCR")
-                else:
-                    pil_img = Image.open(file_path)
-                    # Cap large images at 2000px to keep memory reasonable
-                    w, h = pil_img.size
-                    if max(w, h) > 2000:
-                        scale = 2000 / max(w, h)
-                        pil_img = pil_img.resize(
-                            (int(w * scale), int(h * scale)), Image.LANCZOS)
-                    gray_arr = np.array(ImageOps.grayscale(pil_img))
-                    pil_img = None; gc.collect()
-                    text_out = _tess_cli_ocr_page(gray_arr, timeout=20)
-                    gray_arr = None; gc.collect()
-                    text = clean_text(text_out)
-                    conf = 75.0 if text else 0.0
-            except ImportError:
-                # psutil not installed — run without guard
+        elif name.endswith((".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".webp", ".bmp")):
+            # ONLY Tesseract — never load EasyOCR/TrOCR/PaddleOCR in bulk
+            if _HAS_TESS:
                 try:
                     pil_img = Image.open(file_path)
-                    gray_arr = np.array(ImageOps.grayscale(pil_img))
+                    gray = np.array(pil_img.convert("L"))
                     pil_img = None; gc.collect()
-                    text_out = _tess_cli_ocr_page(gray_arr, timeout=20)
-                    gray_arr = None; gc.collect()
-                    text = clean_text(text_out)
+                    text_out = _tess_cli_ocr_page(gray, timeout=25)
+                    gray = None; gc.collect()
+                    text = clean_text(text_out) if text_out else ""
                     conf = 75.0 if text else 0.0
                 except Exception as e:
-                    print(f"[extract_text_bulk] Image OCR: {e}")
-            except Exception as e:
-                print(f"[extract_text_bulk] Image OCR error: {e}")
-
+                    print(f"[extract_text_bulk] Tesseract image: {e}")
         else:
             text = clean_text(open(file_path, encoding="utf-8", errors="ignore").read())
 
     except Exception as e:
-        print(f"[extract_text_bulk] {file_path}: {e}")
+        print(f"[extract_text_bulk] Error on {os.path.basename(file_path)}: {e}")
 
-    # --- ADVANCED PREPROCESSING ---
-    if text:
-        text = strip_bibliography(text)
-        # Translation in bulk is expensive; we only do it if the user enabled it 
-        # (Assuming 'auto' for now or we could add a flag)
-        text = translate_high_confidence(text)
-        text = clean_text(text)
-
-    print(f"[extract_text_bulk] '{os.path.basename(file_path)}' → "
-          f"{len(text.split())} words, conf={round(conf,1)}%")
+    text = strip_bibliography(text)
+    text = clean_text(text)
+    print(f"[extract_text_bulk] '{os.path.basename(file_path)}' → {len(text.split())} words, conf={round(conf,1)}%")
     return text, content, file_hash, conf
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1626,28 +1655,32 @@ def get_dynamic_weights(ocr_confidence: float) -> tuple:
       who share an academic writing style.
     """
     if ocr_confidence is None or ocr_confidence >= 95:
-        # Digital text: trust structural heavily; semantic is a soft hint only
-        return 0.25, 0.60, 0.15
-    elif ocr_confidence >= 70:
-        # Moderate OCR noise: ease back on structural slightly
-        return 0.30, 0.55, 0.15
+        # Digital text / Perfect OCR: trust structural heavily (80%)
+        return 0.15, 0.80, 0.05
+    elif ocr_confidence >= 60:
+        # High-quality handwriting: balanced
+        return 0.35, 0.55, 0.10
     else:
-        # Poor OCR: structural n-grams are noisy; rely more on semantic + fuzzy
-        return 0.45, 0.40, 0.15
+        # Messy handwriting: shift to semantic but keep structural floor at 40%
+        return 0.50, 0.40, 0.10
 
 
 def compute_fused_score(text1: str, text2: str,
                          ocr_conf: float = 100,
                          precomputed_embeddings: dict = None) -> tuple:
-    """Fuse semantic + structural + stylometric. No fuzzy floor."""
+    """
+    Multi-Layered Hybrid Detection Architecture:
+      Layer 1: Fingerprinting (Winnowing Algorithm) - Exact Copy-Paste
+      Layer 2: Semantic (SentenceTransformers) - Paraphrasing & Meaning
+      Layer 3: Authorship (Stylometrics) - Writing Style & Burstiness
+      
+    Fuses all layers into one percentage based on OCR quality.
+    """
     sem = _semantic_similarity(text1, text2, precomputed_embeddings)
     stt = _structural_similarity(text1, text2)
     sty = _stylometric_similarity(text1, text2)
     w_sem, w_stt, w_sty = get_dynamic_weights(ocr_conf)
     fused = sem*w_sem + stt*w_stt + sty*w_sty
-    if ocr_conf < 95:
-        fuzz  = _fuzzy_ratio(text1, text2)
-        fused = 0.75*fused + 0.25*fuzz  # light blend to handle OCR noise
     return round(fused, 4), sem, stt, sty
 
 
@@ -1672,32 +1705,17 @@ def warmup_models():
         print("[logic] Model warmup complete. System is ready.")
     except Exception as e:
         print(f"[logic] Warmup error (ignorable): {e}")
-    """
-    Pre-load ML similarity models at startup.
-
-    EasyOCR and PaddleOCR are intentionally NOT warmed up here:
-      - They are never used in the bulk plagiarism pipeline
-        (bulk uses Tesseract CLI subprocess instead)
-      - Each consumes 1.5–2 GB RAM; loading both at startup on a low-RAM
-        server is the primary cause of the OOM/SIGTERM that was crashing jobs
-      - They load lazily on first individual-file check if actually needed
-    """
-    if _HAS_ST:
-        try:
-            print("[warmup] SentenceTransformer…")
-            _get_st_model() # Lazy loading for 'Instant Wake-up'
-            print("[warmup] SentenceTransformer ready.")
-        except Exception as e:
-            print(f"[warmup] ST: {e}")
 
     if _HAS_CROSS:
         try:
             print("[warmup] CrossEncoder…")
+            global _cross_model
             from sentence_transformers import CrossEncoder
-            _cross_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+            if _cross_model is None:
+                _cross_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
             print("[warmup] CrossEncoder ready.")
-        except Exception as e:
-            print(f"[warmup] CrossEncoder: {e}")
+        except Exception:
+            pass
 
     print("[warmup] Done. EasyOCR/PaddleOCR will load lazily if needed.")
 
@@ -1989,14 +2007,31 @@ def generate_heatmap_data(text: str, other_submissions: list,
         for h in sent_fp:
             if h in other_hashes:
                 is_copied = True
-                matched_peer = other_authors.get(h, 'Another Student')
+                matched_peer = other_authors.get(h, f"another student")
                 break
         
+        # B. Layer 2 (Yellow) — Semantic Paraphrasing Check
+        is_paraphrased = False
+        if not is_copied and len(sent.split()) > 10 and not fast_mode:
+             # Semantic sentence check is too slow for bulk; we skip it if fast_mode=True
+             # to keep the 1,000 docs / second goal.
+             for other in other_submissions:
+                 ot = other.get('text', '')
+                 if not ot: continue
+                 if _tfidf_similarity(sent, ot[:1500]) > 0.80: # Stricter threshold
+                     is_paraphrased = True
+                     matched_peer = other.get('author_username', 'Another Student')
+                     break
+
         if is_copied:
             heatmap.append({"text": sent, "type": "red", "score": 100.0, "detail": f"Matched with {matched_peer}"})
             continue
+
+        if is_paraphrased:
+            heatmap.append({"text": sent, "type": "yellow", "score": 75.0, "detail": f"Paraphrased from {matched_peer}"})
+            continue
             
-        # B. Layer 3 (Yellow) — AI Perplexity check
+        # C. Layer 3 (Yellow) — AI Perplexity check
         # Skip in fast_mode (Bulk) to maintain production speed on m5.large
         if not fast_mode and len(sent.split()) > 10 and doc_ai['score'] > 40:
             perp = calculate_perplexity(sent)
@@ -2004,7 +2039,7 @@ def generate_heatmap_data(text: str, other_submissions: list,
                 heatmap.append({"text": sent, "type": "yellow", "score": 85.0, "detail": "AI-like patterns"})
                 continue
                 
-        # C. Default (Green) — Original
+        # D. Default (Green) — Original
         heatmap.append({"text": sent, "type": "green", "score": 0.0})
         
     return heatmap
@@ -2101,21 +2136,9 @@ def run_plagiarism_check(file_path: str, other_submissions: list,
 
 
 
-def _bulk_peer_comparison(text, other_submissions, precomputed_embeddings=None):
+def _bulk_peer_comparison(text, other_submissions, ocr_confidence=None, precomputed_embeddings=None):
     """
     Bulk peer comparison — compares one document against all others in the batch.
-
-    Scoring philosophy (revised):
-    - Structural (Winnowing n-gram Jaccard) = gold-standard signal. Requires
-      actual shared character sequences. Carries the most weight.
-    - Semantic (corpus TF-IDF or doc embeddings) = supporting signal only.
-      With corpus TF-IDF, common lab terms like 'router rip', 'objective',
-      'routing table' are automatically down-weighted, so only genuinely
-      unique copied phrases score high.
-    - Stylometric = weak tie-breaker.
-
-    Structural gate: if structural n-gram overlap < 0.12 AND semantic < 0.82,
-    the match is "same topic" not "copied text" — discarded.
     """
     best = {
         'peer_score': 0.0, 'matched_author': None,
@@ -2131,6 +2154,9 @@ def _bulk_peer_comparison(text, other_submissions, precomputed_embeddings=None):
     curr_emb = (precomputed_embeddings or {}).get(curr_cl)
     all_matches = []
 
+    # Get weights based on OCR quality
+    w_sem, w_stt, w_sty = get_dynamic_weights(ocr_confidence)
+
     for other in other_submissions:
         ot = other.get('text', '')
         if not ot or len(ot.split()) < 10:
@@ -2138,44 +2164,34 @@ def _bulk_peer_comparison(text, other_submissions, precomputed_embeddings=None):
         oc = clean_text(ot)
 
         # ── Step 1: Cheap doc-level embedding pre-filter ────────────────────
-        # Only proceed if embeddings are very close (≥0.70 cosine similarity).
-        # Docs that merely cover the same topic sit in the 0.50-0.69 band;
-        # genuine copies or near-duplicates are ≥0.70.
-        if curr_emb is not None and precomputed_embeddings is not None:
+        # Skip this filter for handwritten docs to be safe
+        is_handwritten = (ocr_confidence is not None and ocr_confidence < 95)
+        if not is_handwritten and curr_emb is not None and precomputed_embeddings is not None:
             oe = precomputed_embeddings.get(oc)
             if oe is not None:
                 doc_sim = float(np.dot(curr_emb, oe))
-                if doc_sim < 0.70:
-                    continue  # same topic, not a copy — skip expensive scoring
+                if doc_sim < 0.60: # relaxed filter
+                    continue
 
         # ── Step 2: Compute individual signals ─────────────────────────────
-        # Semantic: use corpus TF-IDF (preferred) or doc embedding dot product
         if curr_emb is not None and precomputed_embeddings is not None:
             oe = precomputed_embeddings.get(oc)
-            if oe is not None:
-                sem = float(np.dot(curr_emb, oe))
-            else:
-                sem = _tfidf_similarity(curr_cl, oc)  # uses _CORPUS_TFIDF if set
+            sem = float(np.dot(curr_emb, oe)) if oe is not None else _tfidf_similarity(curr_cl, oc)
         else:
-            sem = _tfidf_similarity(curr_cl, oc)      # uses _CORPUS_TFIDF if set
+            sem = _tfidf_similarity(curr_cl, oc)
 
-        stt = _structural_similarity(text[:3000], ot[:3000])   # Winnowing n-gram
-        sty = _stylometric_similarity(text[:1500], ot[:1500])  # style features
+        stt = _structural_similarity(text[:4000], ot[:4000])
+        sty = _stylometric_similarity(text[:2000], ot[:2000])
 
-        # We calculate the scores but do NOT discard them with 'continue'.
-        # The user wants to see the actual similarity percentage, even if it's low.
-
-        # ── Step 4: Weighted fusion (structural-dominant) ──────────────────
-        # Digital documents (conf≥95): 25% semantic, 60% structural, 15% style
-        # This mirrors get_dynamic_weights() for consistency.
-        fused = round(sem * 0.25 + stt * 0.60 + sty * 0.15, 4)
-
-        # Apply semantic-confidence discount:
-        # If structural is weak, reduce the overall fused score proportionally.
-        structural_confidence = min(stt / 0.20, 1.0)  # full confidence at 20%+
-        fused = round(fused * (0.5 + 0.5 * structural_confidence), 4)
-
-        # Allow the actual fused score to be recorded so it shows in the UI.
+        # ── Weighted fusion (Handwriting-aware) ───────────────────────────
+        fused = round(sem * w_sem + stt * w_stt + sty * w_sty, 4)
+        
+        # NOISE GATE: If no structural match (copy-paste), penalise semantic-only matches
+        # This prevents "same topic" false positives.
+        if stt < 0.03 and (ocr_confidence is None or ocr_confidence > 75):
+            fused = fused * 0.2
+            
+        fused = max(0.0, min(1.0, fused))
 
         all_matches.append({
             'author': other.get('author_username', 'Unknown'),
@@ -2183,6 +2199,8 @@ def _bulk_peer_comparison(text, other_submissions, precomputed_embeddings=None):
             'filename': other.get('filename', ''),
             'original_filename': other.get('original_filename', ''),
             'fused_score': round(fused * 100, 1),
+            'structural_score': round(stt * 100, 1),
+            'semantic_score': round(sem * 100, 1),
             'top_passages': [],
         })
         if fused > best['peer_score']:
@@ -2232,7 +2250,7 @@ def bulk_run_plagiarism_check_preextracted(text: str, file_hash: str,
     ai_res = detect_ai_dna(text, threshold=70.0)
     ext_score = max(ext["overall_external_score"], ai_res["score"])
     
-    ocr_was_used = is_image or (is_pdf and (ocr_confidence or 100) < 99.0)
+    ocr_was_used = is_image or (is_pdf and (ocr_confidence if ocr_confidence is not None else 100.0) < 99.0)
 
     # ── Heatmap Metadata (ONE-PASS OPTIMIZED) ──────────────────────────────────
     heatmap = generate_heatmap_data(
@@ -2253,6 +2271,7 @@ def bulk_run_plagiarism_check_preextracted(text: str, file_hash: str,
     }
 
     peer = _bulk_peer_comparison(text, other_submissions,
+                                   ocr_confidence=ocr_confidence,
                                    precomputed_embeddings=precomputed_embeddings)
     peer_score = peer["peer_score"]
     result["peer_score"] = peer_score
